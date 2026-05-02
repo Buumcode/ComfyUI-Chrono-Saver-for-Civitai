@@ -1,0 +1,6 @@
+[project]
+name = "comfyui-chrono-save-for-civit"
+description = "Save images with Civitai-compatible metadata using Chrono's strftime folder format"
+version = "1.0.0"
+license = { text = "MIT" }
+dependencies = ["piexif"]
