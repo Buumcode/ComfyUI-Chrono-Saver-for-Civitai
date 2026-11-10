@@ -23,6 +23,8 @@ Main goal was to save ComfyUI-generated image with embedded workflow metadata an
 * Inject Civitai AIR/resources metadata in file metadata
 * Allow Civitai to automatically recognize models and LoRAs
 
+![Chrono Saver for Civitai](https://github.com/user-attachments/assets/c88dc40a-7ead-4e90-9bef-ccf9ac13d2cd)
+
 ---
 ## Installation
 
