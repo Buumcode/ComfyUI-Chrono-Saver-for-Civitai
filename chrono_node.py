@@ -1,5 +1,5 @@
 """
-Chrono Save for Civitai — auto-extracts all generation metadata from the workflow.
+Chrono Saver for Civitai — auto-extracts all generation metadata from the workflow.
 Only 'images' needs to be connected. Everything else is parsed from the hidden
 prompt JSON that ComfyUI always provides.
 
@@ -11,8 +11,6 @@ import os
 import json
 import re
 from datetime import datetime
-from typing import Any, Optional
-from collections import deque
 
 import numpy as np
 from PIL import Image
@@ -22,252 +20,10 @@ import folder_paths
 
 from .saver.saver import save_image
 from .utils import sanitize_filename, get_sha256, full_checkpoint_path_for
-from .utils_civitai import get_civitai_sampler_name, get_civitai_metadata, MAX_HASH_LENGTH
+from .utils_civitai import get_civitai_sampler_name, get_civitai_metadata
 from .prompt_metadata_extractor import PromptMetadataExtractor
 
-
-# ---------------------------------------------------------------------------
-# Workflow Auto-Extractor  (generic — scans all nodes)
-# ---------------------------------------------------------------------------
-
-# Known field names for each metadata type.
-# We scan every node and pick up direct (non-link) values.
-SEED_FIELDS = ("seed", "noise_seed")
-STEPS_FIELDS = ("steps",)
-CFG_FIELDS = ("cfg", "cfg_scale", "guidance")
-SAMPLER_FIELDS = ("sampler_name",)
-SCHEDULER_FIELDS = ("scheduler",)
-DENOISE_FIELDS = ("denoise",)
-WIDTH_FIELDS = ("width", "empty_latent_width")
-HEIGHT_FIELDS = ("height", "empty_latent_height")
-
-# Checkpoint / model loader class_types
-CHECKPOINT_TYPES = {
-    "CheckpointLoaderSimple", "CheckpointLoader",
-    "UNETLoader", "UnetLoaderGGUF",
-}
-
-CKPT_NAME_FIELDS = ("ckpt_name", "unet_name")
-
-
-def _is_direct_value(v) -> bool:
-    """True if v is a direct value (not a node link). Links are [node_id, output_index]."""
-    return not isinstance(v, list)
-
-
-def _first_direct(prompt: dict, field_names: tuple, default=None):
-    """Scan all nodes for the first direct (non-link) value matching any of the field names."""
-    for nid, node in prompt.items():
-        inputs = node.get("inputs", {})
-        for fname in field_names:
-            if fname in inputs and _is_direct_value(inputs[fname]):
-                return inputs[fname]
-    return default
-
-
-def _all_direct(prompt: dict, field_names: tuple) -> list:
-    """Collect all direct values matching field names across all nodes."""
-    results = []
-    for nid, node in prompt.items():
-        inputs = node.get("inputs", {})
-        for fname in field_names:
-            if fname in inputs and _is_direct_value(inputs[fname]):
-                results.append((nid, inputs[fname]))
-    return results
-
-
-def _find_checkpoint_name(prompt: dict) -> str:
-    """Find the checkpoint/model name by scanning ALL nodes for ckpt_name/unet_name fields."""
-    for nid, node in prompt.items():
-        inputs = node.get("inputs", {})
-        for fname in CKPT_NAME_FIELDS:
-            if fname in inputs and _is_direct_value(inputs[fname]):
-                val = str(inputs[fname])
-                if val and val.lower() != "none":
-                    return val
-    return ""
-
-
-def _find_lora_info(prompt: dict) -> list:
-    """
-    Find all LoRA names + strengths from the workflow.
-    Supports: LoraLoader, LoraLoaderModelOnly, Power Lora Loader (rgthree),
-    LoRA Stacker, easy loraStack, and any node with lora_name field.
-    Returns list of (lora_name, strength_model, strength_clip).
-    """
-    loras = []
-    seen_names = set()
-
-    for nid, node in prompt.items():
-        ct = node.get("class_type", "")
-        inputs = node.get("inputs", {})
-
-        # Standard LoraLoader / LoraLoaderModelOnly
-        if "lora_name" in inputs and _is_direct_value(inputs.get("lora_name")):
-            name = str(inputs["lora_name"])
-            if name and name != "None" and name not in seen_names:
-                sm = inputs.get("strength_model", 1.0)
-                sc = inputs.get("strength_clip", 1.0)
-                sm = sm if _is_direct_value(sm) else 1.0
-                sc = sc if _is_direct_value(sc) else 1.0
-                loras.append((name, float(sm), float(sc)))
-                seen_names.add(name)
-
-        # Power Lora Loader (rgthree) — dynamic inputs like lora_1, lora_2, ...
-        # Each value is a dict: {"on": True, "lora": "filename.safetensors", "strength": 0.9}
-        if "rgthree" in ct.lower() or "power" in ct.lower() or "lora" in ct.lower():
-            for key, val in inputs.items():
-                if key.startswith("lora_") and isinstance(val, dict):
-                    if val.get("on", False) and val.get("lora"):
-                        name = str(val["lora"])
-                        if name and name != "None" and name not in seen_names:
-                            strength = float(val.get("strength", 1.0))
-                            loras.append((name, strength, strength))
-                            seen_names.add(name)
-
-        # easy loraStack / Lora Stacker — numbered lora inputs
-        if "stack" in ct.lower() and "lora" in ct.lower():
-            for key, val in inputs.items():
-                if ("lora" in key.lower() and "name" in key.lower()
-                    and _is_direct_value(val)):
-                    name = str(val)
-                    if name and name != "None" and name not in seen_names:
-                        loras.append((name, 1.0, 1.0))
-                        seen_names.add(name)
-
-    return loras
-
-
-def _find_clip_texts(prompt: dict) -> dict:
-    """Find all CLIPTextEncode nodes and extract their text."""
-    texts = {}
-    for nid, node in prompt.items():
-        if node.get("class_type") == "CLIPTextEncode":
-            text = node.get("inputs", {}).get("text", "")
-            if isinstance(text, str):
-                texts[nid] = text
-            elif isinstance(text, list):
-                texts[nid] = _follow_text_link(text, prompt)
-    return texts
-
-
-def _follow_text_link(link, prompt, depth=0) -> str:
-    """Follow a node link to resolve a text value."""
-    if depth > 5 or not isinstance(link, list) or len(link) < 1:
-        return ""
-    nid = str(link[0])
-    node = prompt.get(nid, {})
-    inputs = node.get("inputs", {})
-    for key in ("text", "string", "text_positive", "text_negative", "value",
-                "text_g", "text_l", "prompts_text"):
-        if key in inputs:
-            val = inputs[key]
-            if isinstance(val, str):
-                return val
-            if isinstance(val, list):
-                return _follow_text_link(val, prompt, depth + 1)
-    return ""
-
-
-def _trace_to_clip_text(start_nid: str, prompt: dict, clip_texts: dict) -> str:
-    """BFS from a node backwards to find CLIPTextEncode text."""
-    if start_nid in clip_texts:
-        return clip_texts[start_nid]
-
-    visited = set()
-    queue = deque([start_nid])
-
-    while queue:
-        nid = queue.popleft()
-        if nid in visited:
-            continue
-        visited.add(nid)
-
-        if nid in clip_texts:
-            return clip_texts[nid]
-
-        node = prompt.get(nid, {})
-        for val in node.get("inputs", {}).values():
-            if isinstance(val, list) and len(val) >= 1:
-                next_nid = str(val[0])
-                if next_nid not in visited:
-                    queue.append(next_nid)
-
-        if len(visited) > 50:
-            break
-
-    return ""
-
-
-def _find_prompts(prompt: dict) -> tuple:
-    """Find positive and negative prompt text from the workflow."""
-    clip_texts = _find_clip_texts(prompt)
-    positive = ""
-    negative = ""
-
-    # Look for any node that has both "positive" and "negative" conditioning inputs
-    for nid, node in prompt.items():
-        inputs = node.get("inputs", {})
-
-        pos_ref = inputs.get("positive")
-        neg_ref = inputs.get("negative")
-
-        if isinstance(pos_ref, list) and not positive:
-            found = _trace_to_clip_text(str(pos_ref[0]), prompt, clip_texts)
-            if found:
-                positive = found
-
-        if isinstance(neg_ref, list) and not negative:
-            found = _trace_to_clip_text(str(neg_ref[0]), prompt, clip_texts)
-            if found:
-                negative = found
-
-        if positive and negative:
-            break
-
-    # Fallback: if no conditioning links found, just grab CLIPTextEncode texts by length
-    if not positive and clip_texts:
-        sorted_texts = sorted(clip_texts.values(), key=len, reverse=True)
-        positive = sorted_texts[0] if sorted_texts else ""
-        if len(sorted_texts) > 1:
-            negative = sorted_texts[1]
-
-    return positive, negative
-
-
-def _extract_from_workflow(prompt: dict) -> dict:
-    """Parse the ComfyUI workflow prompt to extract all generation parameters."""
-    if not prompt:
-        return {
-            "positive": "", "negative": "", "modelname": "",
-            "loras": [],
-            "seed": 0, "steps": 20, "cfg": 7.0,
-            "sampler_name": "", "scheduler_name": "normal",
-            "width": 512, "height": 512, "denoise": 1.0,
-        }
-
-    positive, negative = _find_prompts(prompt)
-
-    # Pick the best width/height — prefer larger values (actual generation size)
-    all_widths = _all_direct(prompt, WIDTH_FIELDS)
-    all_heights = _all_direct(prompt, HEIGHT_FIELDS)
-    width = max((v for _, v in all_widths), default=512) if all_widths else 512
-    height = max((v for _, v in all_heights), default=512) if all_heights else 512
-
-    return {
-        "positive": positive,
-        "negative": negative,
-        "modelname": _find_checkpoint_name(prompt),
-        "loras": _find_lora_info(prompt),
-        "seed": _first_direct(prompt, SEED_FIELDS, 0),
-        "steps": _first_direct(prompt, STEPS_FIELDS, 20),
-        "cfg": _first_direct(prompt, CFG_FIELDS, 7.0),
-        "sampler_name": _first_direct(prompt, SAMPLER_FIELDS, ""),
-        "scheduler_name": _first_direct(prompt, SCHEDULER_FIELDS, "normal"),
-        "width": int(width),
-        "height": int(height),
-        "denoise": _first_direct(prompt, DENOISE_FIELDS, 1.0),
-    }
+from .chrono_core import Session
 
 
 # ---------------------------------------------------------------------------
@@ -307,43 +63,506 @@ def _clean_prompt(prompt_text: str, extractor: PromptMetadataExtractor) -> str:
     return prompt_text
 
 
-def _parse_manual_hashes(additional_hashes: str, existing_hashes: set, download_civitai: bool):
-    re_hash = re.compile(r'^\s*([^:]+?)(?:\s*:\s*([^\s:][^:]*?))?\s*$')
-    re_hash_w = re.compile(r'^\s*([^:]+?)(?:\s*:\s*([^\s:][^:]*?))?(?:\s*:\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)))?\s*$')
-    manual = {}
-    unnamed = 0
-    for entry in (additional_hashes.replace("\n", ",").split(",") if additional_hashes else []):
-        m = (re_hash_w if download_civitai else re_hash).search(entry)
-        if m is None:
+def _metadata_scalar(value, default=0):
+    """
+    Convert Chrono Core multi-values into a harmless scalar.
+    Used only for Civitai compatibility prompt.
+    Real data remains in workflow chunk.
+    """
+
+    if isinstance(value, list):
+
+        if not value:
+            return default
+
+        # берем первое найденное значение,
+        # потому что metadata является декоративной
+        return _metadata_scalar(value[0], default)
+
+    if isinstance(value, tuple):
+
+        if not value:
+            return default
+
+        return _metadata_scalar(value[0], default)
+
+    return value        
+
+
+def _normalize_air(air: str) -> str:
+    """Normalize diffusionmodel AIRs to checkpoint AIRs."""
+    air = (air or "").strip()
+    return re.sub(
+        r"^(urn:air:[a-z0-9._-]+:)diffusionmodel(:civitai:)",
+        r"\1checkpoint\2",
+        air,
+        flags=re.IGNORECASE,
+    )
+
+
+def _parse_resource_airs(resources_to_keep: str) -> list[str]:
+    """Extract complete AIR identifiers even if upstream collapses newlines."""
+    pattern = (
+        r"urn:air:[a-z0-9._-]+:[a-z0-9._-]+:civitai:\d+"
+        r"(?:@\d+)?(?:\+\d+)?"
+    )
+    result = []
+    seen = set()
+    for match in re.finditer(pattern, resources_to_keep or "", flags=re.IGNORECASE):
+        air = _normalize_air(match.group(0))
+        key = air.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(air)
+    return result
+
+
+def _air_resource_type(air: str) -> str:
+    """Return the AIR's resource type segment, or an empty string if invalid."""
+    match = re.match(
+        r"^urn:air:[a-z0-9._-]+:([a-z0-9._-]+):civitai:\d+(?:@\d+)?(?:\+\d+)?$",
+        (air or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    kind = match.group(1).lower()
+    return "checkpoint" if kind == "diffusionmodel" else kind
+
+
+def _is_lora_air(air: str) -> bool:
+    return _air_resource_type(air) == "lora"
+
+
+def _is_checkpoint_air(air: str) -> bool:
+    return _air_resource_type(air) == "checkpoint"
+
+
+def _filter_civitai_resources(
+    resources: list[dict],
+    remove_all_loras: bool,
+    resources_to_keep: str,
+) -> list[dict]:
+    """
+    Filter metadata resources only.
+    Preserve checkpoints and all non-LoRA resource types.
+    """
+    # Normalize every existing AIR regardless of whether LoRA filtering is enabled.
+    normalized_resources = []
+    for resource in resources:
+        normalized = dict(resource)
+        if normalized.get("air"):
+            normalized["air"] = _normalize_air(normalized["air"])
+        normalized_resources.append(normalized)
+
+    if not remove_all_loras:
+        return normalized_resources
+
+    keep_airs = {air.lower() for air in _parse_resource_airs(resources_to_keep)}
+    filtered = []
+
+    for resource in normalized_resources:
+        air = resource.get("air", "")
+
+        if not _is_lora_air(air):
+            filtered.append(resource)
             continue
-        groups = tuple(g for g in m.groups() if g)
-        weight = None
-        if download_civitai and len(groups) > 1:
-            try:
-                weight = float(groups[-1])
-                groups = groups[:-1]
-            except (ValueError, TypeError):
-                pass
-        name, hash_val = groups if len(groups) > 1 else (None, groups[0])
-        if len(hash_val) > MAX_HASH_LENGTH:
+
+        if air.lower() in keep_airs:
+            filtered.append(resource)
+
+    return filtered
+
+def build_civitai_prompt(
+    positive,
+    negative,
+    modelname,
+    checkpoint_air,
+    lora_entries,
+    seed,
+    steps,
+    cfg,
+    sampler_name,
+    scheduler_name,
+    denoise,
+    width,
+    height,
+    checkpoint_airs=None,
+):
+    """
+    Build a synthetic minimal ComfyUI prompt specifically for Civitai parsing.
+
+    This prompt is NOT the real workflow.
+
+    It contains:
+      - checkpoint/model loader
+      - CLIP text encode positive
+      - CLIP text encode negative
+      - optional LoRA chain
+      - KSampler
+      - EmptyLatentImage
+      - VAEDecode
+      - SaveImage
+
+    Resource loader names are replaced by Civitai AIRs.
+    """
+
+    prompt = {}
+    lora_entries = lora_entries or []
+
+    # All checkpoint AIRs are represented in the synthetic metadata prompt.
+    checkpoint_airs = checkpoint_airs or []
+    if checkpoint_airs and not checkpoint_air:
+        checkpoint_air = checkpoint_airs[0]
+
+    width = _metadata_scalar(width, 0)
+    height = _metadata_scalar(height, 0)
+    seed = _metadata_scalar(seed, 0)
+    steps = _metadata_scalar(steps, 0)
+    cfg = _metadata_scalar(cfg, 0)
+
+    sampler_name = _metadata_scalar(sampler_name, "unknown")
+    scheduler_name = _metadata_scalar(scheduler_name, "unknown")
+
+    # ---------------------------------------------------------
+    # Fixed node IDs
+    # ---------------------------------------------------------
+
+    POSITIVE_ID = "6"
+    VAE_DECODE_ID = "8"
+    MODEL_ID = "29"
+    SAVE_IMAGE_ID = "48"
+    KSAMPLER_ID = "75"
+    LATENT_ID = "76"
+    NEGATIVE_ID = "90"
+
+    # ---------------------------------------------------------
+    # Positive prompt
+    # ---------------------------------------------------------
+
+    prompt[POSITIVE_ID] = {
+        "inputs": {
+            "text": str(positive or ""),
+            "clip": ["85", 1],
+        },
+        "class_type": "CLIPTextEncode",
+        "_meta": {
+            "title": "CLIP Text Encode (Prompt)"
+        },
+    }
+
+    # ---------------------------------------------------------
+    # Negative prompt
+    # ---------------------------------------------------------
+
+    prompt[NEGATIVE_ID] = {
+        "inputs": {
+            "text": str(negative or ""),
+            "clip": ["85", 1],
+        },
+        "class_type": "CLIPTextEncode",
+        "_meta": {
+            "title": "CLIP Text Encode (Prompt)"
+        },
+    }
+
+    # ---------------------------------------------------------
+    # Model loader
+    # ---------------------------------------------------------
+
+    if checkpoint_air:
+        prompt[MODEL_ID] = {
+            "inputs": {
+                "ckpt_name": checkpoint_air,
+            },
+            "class_type": "CheckpointLoaderSimple",
+            "_meta": {
+                "title": "Load Checkpoint"
+            },
+        }
+
+    else:
+        # Fallback: retain original model name if Civitai AIR
+        # could not be determined.
+        prompt[MODEL_ID] = {
+            "inputs": {
+                "ckpt_name": modelname or "",
+            },
+            "class_type": "CheckpointLoaderSimple",
+            "_meta": {
+                "title": "Load Checkpoint"
+            },
+        }
+
+    # ---------------------------------------------------------
+    # Additional checkpoint loaders are intentionally disconnected from
+    # generation. Civitai scans them to identify all declared resources.
+    # ---------------------------------------------------------
+
+    primary_air_key = (checkpoint_air or "").lower()
+    extra_checkpoint_airs = []
+    seen_checkpoint_airs = {primary_air_key} if primary_air_key else set()
+    for air in checkpoint_airs:
+        air = _normalize_air(air)
+        key = air.lower()
+        if not _is_checkpoint_air(air) or key in seen_checkpoint_airs:
             continue
-        if hash_val.lower() in existing_hashes:
+        seen_checkpoint_airs.add(key)
+        extra_checkpoint_airs.append(air)
+
+    for index, air in enumerate(extra_checkpoint_airs, start=1):
+        node_id = str(100 + index)
+        prompt[node_id] = {
+            "inputs": {"ckpt_name": air},
+            "class_type": "CheckpointLoaderSimple",
+            "_meta": {"title": f"Additional Checkpoint {index + 1}"},
+        }
+
+    # ---------------------------------------------------------
+    # LoRA chain
+    # ---------------------------------------------------------
+
+    current_model_id = MODEL_ID
+    current_clip_id = MODEL_ID
+
+    lora_counter = 85
+
+    for entry in lora_entries:
+        lora = entry["lora"]
+        air = entry["air"]
+
+        if not air:
             continue
-        if name is None:
-            unnamed += 1
-            name = f"manual{unnamed}"
-        manual[name] = (None, weight, hash_val)
-        if len(manual) > 29:
-            break
-    return manual
+
+        node_id = str(lora_counter)
+        lora_counter += 1
+
+        strength_model = lora.get("strength_model", 1)
+        strength_clip = lora.get("strength_clip")
+
+        if strength_clip is None:
+            strength_clip = strength_model
+
+        prompt[node_id] = {
+            "inputs": {
+                "lora_name": air,
+                "strength_model": strength_model,
+                "strength_clip": strength_clip,
+                "model": [current_model_id, 0],
+                "clip": [current_clip_id, 1],
+            },
+            "class_type": "LoraLoader",
+            "_meta": {
+                "title": "Load LoRA (Model and CLIP)"
+            },
+        }    
+
+        current_model_id = node_id
+        current_clip_id = node_id
+
+    # ---------------------------------------------------------
+    # Reconnect CLIP encoders to the final LoRA
+    # ---------------------------------------------------------
+
+    prompt[POSITIVE_ID]["inputs"]["clip"] = [current_clip_id, 1]
+    prompt[NEGATIVE_ID]["inputs"]["clip"] = [current_clip_id, 1]
+
+    # ---------------------------------------------------------
+    # Empty latent
+    # ---------------------------------------------------------
+
+    prompt[LATENT_ID] = {
+        "inputs": {
+            "width": int(width),
+            "height": int(height),
+            "batch_size": 1,
+        },
+        "class_type": "EmptyLatentImage",
+        "_meta": {
+            "title": "Empty Latent Image"
+        },
+    }
+
+    # ---------------------------------------------------------
+    # KSampler
+    # ---------------------------------------------------------
+
+    prompt[KSAMPLER_ID] = {
+        "inputs": {
+            "seed": int(seed),
+            "steps": int(steps),
+            "cfg": float(cfg),
+            "sampler_name": sampler_name,
+            "scheduler": scheduler_name,
+            "denoise": float(denoise if denoise is not None else 1.0),
+            "model": [current_model_id, 0],
+            "positive": [POSITIVE_ID, 0],
+            "negative": [NEGATIVE_ID, 0],
+            "latent_image": [LATENT_ID, 0],
+        },
+        "class_type": "KSampler",
+        "_meta": {
+            "title": "KSampler"
+        },
+    }
+
+    # ---------------------------------------------------------
+    # VAE Decode
+    #
+    # For the first test we don't need to identify a real VAE.
+    # The Civitai parser is primarily interested in the model,
+    # LoRAs and generation parameters.
+    # ---------------------------------------------------------
+
+    prompt[VAE_DECODE_ID] = {
+        "inputs": {
+            "samples": [KSAMPLER_ID, 0],
+            "vae": [MODEL_ID, 2],
+        },
+        "class_type": "VAEDecode",
+        "_meta": {
+            "title": "VAE Decode"
+        },
+    }
+
+    # ---------------------------------------------------------
+    # SaveImage
+    # ---------------------------------------------------------
+
+    prompt[SAVE_IMAGE_ID] = {
+        "inputs": {
+            "filename_prefix": "ComfyUI",
+            "images": [VAE_DECODE_ID, 0],
+        },
+        "class_type": "SaveImage",
+        "_meta": {
+            "title": "Save Image"
+        },
+    }
+
+    return prompt
+
+
+def find_power_lora(workflow):
+    loras = []
+
+    if not isinstance(workflow, dict):
+        return loras
+
+    nodes = workflow.get("nodes", [])
+
+    for node in nodes:
+
+        if not isinstance(node, dict):
+            continue
+
+        node_type = node.get("type", "")
+
+        if "Power Lora Loader" not in node_type:
+            continue
+
+
+        # Приоритет: widgets_values_named
+        named = node.get("widgets_values_named", {})
+
+        for key, item in named.items():
+
+            if not key.startswith("lora_"):
+                continue
+
+            if not isinstance(item, dict):
+                continue
+
+            if not item.get("on", True):
+                continue
+
+            name = item.get("lora")
+
+            if not name:
+                continue
+
+            loras.append({
+                "name": name,
+                "strength_model": item.get("strength", 1),
+                "strength_clip": item.get("strengthTwo"),
+            })
+
+
+        # fallback для старых workflow
+        if not named:
+
+            widgets = node.get("widgets_values", [])
+
+            for item in widgets:
+
+                if not isinstance(item, dict):
+                    continue
+
+                if "lora" not in item:
+                    continue
+
+                if not item.get("on", True):
+                    continue
+
+                loras.append({
+                    "name": item["lora"],
+                    "strength_model": item.get("strength", 1),
+                    "strength_clip": item.get("strengthTwo"),
+                })
+
+
+    return loras
+
+
+def resolve_prompt_value(value, prompt):
+    """
+    Resolve ComfyUI link values:
+    [node_id, output_index]
+    into actual widget value.
+    """
+
+    if not isinstance(value, list):
+        return value
+
+    if len(value) != 2:
+        return value
+
+    node_id = str(value[0])
+
+    node = prompt.get(node_id)
+
+    if not node:
+        return value
+
+
+    inputs = node.get("inputs", {})
+
+
+    # common primitive values
+
+    for key in [
+        "value",
+        "int",
+        "float",
+        "number",
+        "seed",
+        "width",
+        "height"
+    ]:
+
+        if key in inputs:
+            return inputs[key]
+
+
+    return value
 
 
 # ---------------------------------------------------------------------------
 # Node
 # ---------------------------------------------------------------------------
 
-class ChronoSaveForCivit:
-    CATEGORY = "chrono-save-for-civit"
+class ChronoSaverForCivitai:
+    CATEGORY = "chrono-saver-for-civitai"
     FUNCTION = "save_images"
     OUTPUT_NODE = True
     RETURN_TYPES = ()
@@ -356,25 +575,25 @@ class ChronoSaveForCivit:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images":                ("IMAGE",),
-                "filename_prefix":       ("STRING",  {"default": "%Y-%m-%d_Civitai",
+                "images":                           ("IMAGE",),
+                "filename_prefix":                  ("STRING",  {"default": "%Y-%m-%d_%H-%M-%S_Civitai",
                                                       "tooltip": "Supports strftime: %Y %m %d %H %M %S, plus %seed %model"}),
-                "folder":                ("STRING",  {"default": "Zimage/%Y-%m-%d/Civitai/",
-                                                      "tooltip": "Subfolder under ComfyUI output dir. Supports strftime."}),
-                "file_format":           (["jpeg", "png", "webp"],),
-                "quality":               ("INT",     {"default": 100, "min": 1, "max": 100}),
-                "embed_workflow":        ("BOOLEAN", {"default": False,
+                "folder":                           ("STRING",  {"default": "Krea2/%Y-%m-%d/Civitai/",
+                                                      "tooltip": "Subfolder under ComfyUI output dir. Supports strftime %Y %m %d %H %M %S."}),
+                "file_format":                      (["png", "jpeg", "webp"],),
+                "quality":                          ("INT",     {"default": 85, "min": 1, "max": 100}),
+                "embed_workflow":                   ("BOOLEAN", {"default": True,
                                                       "tooltip": "False = no workflow leak. True = embed workflow in image."}),
-                "download_civitai_data": ("BOOLEAN", {"default": True,
-                                                      "tooltip": "Fetch resource info from civitai.com for resource linking."}),
-                "easy_remix":            ("BOOLEAN", {"default": True,
-                                                      "tooltip": "Strip LoRAs from prompt for cleaner Civitai remix."}),
+                "download_civitai_data":            ("BOOLEAN", {"default": True,
+                                                      "tooltip": "Fetch resource info from Civitai.com for resource linking."}),
+                "easy_remix":                       ("BOOLEAN", {"default": False,
+                                                      "tooltip": "Strip <lora:example_lora:0.9> and SUBJECT1(deleted text) from prompt text."}),
+                "remove_all_loras_from_resources":  ("BOOLEAN", {"default": False,"tooltip": "Remove all LoRA resources except AIRs listed in resources_to_keep."}),
             },
             "optional": {
-                "positive_override":     ("STRING",  {"default": "", "multiline": True, "forceInput": True,
-                                                      "tooltip": "Override auto-detected positive prompt. Wire from Chrono Prompt Queue."}),
-                "additional_hashes":     ("STRING",  {"default": "", "multiline": False,
-                                                      "tooltip": "Extra resource hashes: 'Name:HASH' separated by commas."}),
+                "positive_override":    ("STRING",  {"default": "", "multiline": True, "forceInput": True,
+                                                      "tooltip": "Override auto-detected positive prompt. Wire from STRING output."}),
+                "resources_to_keep":    ("STRING",  {"default": "", "multiline": True, "tooltip": "Civitai AIRs to include in metadata (LoRA, checkpoint, etc.), one AIR per line."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -385,31 +604,87 @@ class ChronoSaveForCivit:
     def save_images(
         self,
         images,
-        filename_prefix="%Y-%m-%d_Civitai",
-        folder="Zimage/%Y-%m-%d/Civitai/",
-        file_format="jpeg",
-        quality=100,
-        embed_workflow=False,
+        filename_prefix="%Y-%m-%d_%H-%M-%S_Civitai",
+        folder="Krea2/%Y-%m-%d/Civitai/",
+        file_format="png",
+        quality=85,
+        embed_workflow=True,
         download_civitai_data=True,
-        easy_remix=True,
+        easy_remix=False,
         positive_override="",
-        additional_hashes="",
         prompt=None,
         extra_pnginfo=None,
+        remove_all_loras_from_resources=False,
+        resources_to_keep="",
     ):
-        # --- Auto-extract metadata from workflow ---
-        wf = _extract_from_workflow(prompt or {})
 
-        positive = positive_override.strip() if positive_override.strip() else wf["positive"]
-        negative = wf["negative"]
-        modelname = wf["modelname"]
-        seed = wf["seed"]
-        steps = wf["steps"]
-        cfg = wf["cfg"]
-        sampler_name = wf["sampler_name"]
-        scheduler_name = wf["scheduler_name"]
-        width = wf["width"]
-        height = wf["height"]
+        # --- Auto-extract metadata from workflow ---
+        from .chrono_core import Session
+
+        session = Session(prompt or {})
+        report = session.report.to_dict()
+#       print(report)
+
+        positive = positive_override.strip() if positive_override.strip() else report["prompts"]["positive"]
+        negative = report["prompts"]["negative"]
+        model_info = report.get("model") or {}
+
+        modelname = (
+            model_info.get("checkpoint")
+            or model_info.get("unet")
+            or ""
+        )
+
+        sampler = report.get("sampler") or {}
+
+        seed = resolve_prompt_value(
+            sampler.get("seed",0),
+            prompt
+        )
+        steps = sampler.get("steps", 0)
+        cfg = sampler.get("cfg", 0)
+        sampler_name = sampler.get("sampler", "unknown")
+        scheduler_name = sampler.get("scheduler", "unknown")
+        denoise = sampler.get("denoise", None)
+
+        # ---------------------------------------------------------
+        # Image size — use the actual IMAGE tensor from ComfyUI
+        #
+        # ComfyUI IMAGE format:
+        # [batch, height, width, channels]
+        # ---------------------------------------------------------
+
+        height = int(images.shape[1])
+        width = int(images.shape[2])
+
+        # ---------------------------------------------------------
+        # Normalize decorative metadata values
+        # ---------------------------------------------------------
+
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError):
+            seed = 0
+
+        try:
+            steps = int(steps)
+        except (TypeError, ValueError):
+            steps = 0
+
+        try:
+            cfg = float(cfg)
+        except (TypeError, ValueError):
+            cfg = 0.0
+
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            width = int(images[0].shape[2])
+
+        try:
+            height = int(height)
+        except (TypeError, ValueError):
+            height = int(images[0].shape[1])
 
         # --- Resolve strftime in folder and filename ---
         resolved_folder = _resolve_strftime(folder).strip().rstrip("/")
@@ -420,68 +695,279 @@ class ChronoSaveForCivit:
         modelhash = get_sha256(ckpt_path)[:10] if ckpt_path else ""
 
         # Extract loras/embeddings from prompt text (<lora:name:weight> format)
-        extractor = PromptMetadataExtractor([positive, negative])
+        extractor = PromptMetadataExtractor(
+            positive_prompt=str(positive) if positive is not None else None,
+            negative_prompt=str(negative) if negative is not None else None
+        )
         embeddings = extractor.get_embeddings()
         prompt_loras = extractor.get_loras()
 
         # Also extract loras from workflow nodes (LoraLoader, Power Lora Loader, etc.)
         from .utils import full_lora_path_for
         from .utils_civitai import civitai_lora_key_name
-        node_loras = {}
-        for lora_name, strength_model, strength_clip in wf["loras"]:
-            key = civitai_lora_key_name(os.path.splitext(os.path.basename(lora_name))[0])
-            if key not in prompt_loras:  # Don't duplicate
-                lora_path = full_lora_path_for(lora_name)
-                if lora_path:
-                    lora_hash = get_sha256(lora_path)[:10]
-                    node_loras[key] = (lora_path, strength_model, lora_hash)
 
-        # Merge: prompt-detected + node-detected loras
+        node_loras = {}
+
+        detected_loras = list(report["loras"])
+
+        # fallback для Power Lora Loader (rgthree)
+        workflow_data = {}
+
+        if extra_pnginfo and isinstance(extra_pnginfo, dict):
+            workflow_data = extra_pnginfo.get("workflow", {})
+
+        power_loras = find_power_lora(workflow_data)
+
+#       print("\n=== POWER LORAS ===")
+#       for l in power_loras:
+#           print(l)
+
+        existing = {
+            l["name"]
+            for l in detected_loras
+        }
+
+        for lora in power_loras:
+            if lora["name"] not in existing:
+                detected_loras.append(lora)
+
+
+        for lora in detected_loras:
+
+            lora_path = full_lora_path_for(lora["name"])
+
+            if lora_path is None:
+                continue
+
+            key = civitai_lora_key_name(
+                os.path.splitext(os.path.basename(lora["name"]))[0]
+            )
+
+            node_loras[key] = (
+                lora_path,
+                lora.get("strength_model", 1),
+                get_sha256(lora_path)[:10],
+            )
+
+        # Merge: prompt-detected + node-detected loras    
         loras = {**prompt_loras, **node_loras}
 
         display_sampler = get_civitai_sampler_name(
             sampler_name.replace("_gpu", ""), scheduler_name
-        )
+        )        
+
         basemodelname = _parse_ckpt_basename(modelname)
 
-        existing_hashes = ({modelhash.lower()} |
-                          {t[2].lower() for t in loras.values()} |
-                          {t[2].lower() for t in embeddings.values()})
-        manual_entries = _parse_manual_hashes(additional_hashes, existing_hashes, download_civitai_data)
-
-        civitai_resources, hashes, add_model_hash = get_civitai_metadata(
-            modelname, ckpt_path, modelhash, loras, embeddings, manual_entries, download_civitai_data
+        civitai_resources = get_civitai_metadata(
+            modelname,
+            ckpt_path,
+            modelhash,
+            loras,
+            embeddings,
+            {},
+            download_civitai_data,
         )
+
+        # ---------------------------------------------------------
+        # Build a lookup of local LoRAs by SHA-256, matching the known-working
+        # implementation. Civitai-discovered resources carry _local_hash;
+        # manually supplied AIRs intentionally do not need a local file.
+        # ---------------------------------------------------------
+
+        local_loras_by_hash = {}
+
+        for lora in detected_loras:
+            lora_path = full_lora_path_for(lora["name"])
+            if lora_path is None:
+                continue
+            lora_hash = get_sha256(lora_path)[:10].lower()
+            local_loras_by_hash.setdefault(lora_hash, []).append(lora)
+
+        # Filter resources for metadata only. The real workflow/generation is
+        # untouched; non-LoRA resources are retained by the filter.
+        metadata_resources = _filter_civitai_resources(
+            civitai_resources,
+            remove_all_loras_from_resources,
+            resources_to_keep,
+        )
+
+        # Add every manually supplied AIR to saved metadata. AIRs can describe
+        # LoRAs, checkpoints, or other resources; no local filename is required.
+        manual_airs = _parse_resource_airs(resources_to_keep)
+        existing_airs = {
+            _normalize_air(str(resource.get("air", ""))).lower()
+            for resource in metadata_resources
+            if resource.get("air")
+        }
+        for air in manual_airs:
+            normalized_air = _normalize_air(air)
+            if normalized_air.lower() not in existing_airs:
+                metadata_resources.append({"air": normalized_air, "weight": 1.0})
+                existing_airs.add(normalized_air.lower())
+
+        # Build synthetic-prompt LoRA entries using the previously working
+        # hash match. If no unique local match exists, still include the AIR
+        # with its metadata weight (default 1.0); do not require filenames.
+        lora_entries = []
+        for resource in metadata_resources:
+            air = resource.get("air", "")
+            if not air or not _is_lora_air(air):
+                continue
+
+            resource_hash = str(resource.get("_local_hash", "")).lower()[:10]
+            matching_loras = local_loras_by_hash.get(resource_hash, [])
+
+            if len(matching_loras) == 1:
+                lora = matching_loras[0]
+            else:
+                weight = resource.get("weight", 1.0)
+                lora = {
+                    "name": air,
+                    "strength_model": weight,
+                    "strength_clip": weight,
+                }
+
+            lora_entries.append({"lora": lora, "air": air})
+
+        # ---------------------------------------------------------
+        # Find checkpoint AIR in the filtered resource list.
+        # Checkpoints are preserved by the filter.
+        # ---------------------------------------------------------
+
+        checkpoint_air = next(
+            (
+                r.get("air")
+                for r in metadata_resources
+                if r.get("air")
+                and _is_checkpoint_air(r["air"])
+            ),
+            None,
+        )
+
+        # Every checkpoint AIR included in metadata is also represented in the
+        # synthetic Civitai prompt; extra loaders remain disconnected from generation.
+        checkpoint_airs_for_prompt = [
+            _normalize_air(r.get("air", ""))
+            for r in metadata_resources
+            if _is_checkpoint_air(r.get("air", ""))
+        ]
+
+        # ---------------------------------------------------------
+        # Normalize LoRA weights in metadata.
+        # ---------------------------------------------------------
+
+        for entry in lora_entries:
+            resource = next(
+                (
+                    r for r in metadata_resources
+                    if r.get("air") == entry["air"]
+                ),
+                None,
+            )
+
+            if resource is None or "weight" in resource:
+                continue
+
+            resource["weight"] = entry["lora"].get(
+                "strength_model", 1
+            )
+
+#       print("\n=== CIVITAI AIRs ===")
+
+#       print(f"Checkpoint AIR: {checkpoint_air}")
+
+
+#       print(f"Checkpoint AIR: {checkpoint_air}")
+
+#       for index, air in enumerate(lora_airs, 1):
+#           print(f"LoRA #{index}: {air}")
+
+
+        # Normalize LoRA weights for Civitai workflow resources
+        for resource in civitai_resources:
+            if resource.get("air") and ":lora:" in resource["air"]:
+                if "weight" not in resource:
+                    version = resource["air"].split("@")[-1]
+
+                    for lora in detected_loras:
+                        if lora.get("strength_model") is not None:
+                            resource["weight"] = lora["strength_model"]
+                            break        
+
+        exif_resources = []
+
+        for resource in metadata_resources:
+            air = resource.get("air")
+            if not air:
+                continue
+
+            version_match = re.search(r"@(\d+)", air)
+            if not version_match:
+                continue
+            version_id = int(version_match.group(1))
+
+            if _is_lora_air(air):
+                resource_type = "lora"
+            elif _is_checkpoint_air(air):
+                resource_type = "checkpoint"
+            else:
+                # Keep other AIR types in the workflow resources list, but do
+                # not mislabel them as checkpoints in EXIF's typed resource list.
+                continue
+
+            exif_resources.append({
+                "modelVersionId": version_id,
+                "strength": resource.get("weight", 1),
+                "type": resource_type,
+            })
+
+        airs = [
+            resource["air"]
+            for resource in metadata_resources
+            if resource.get("air")
+        ]
 
         # Clean prompts for remix if requested
-        pos_text = _clean_prompt(positive, extractor).strip() if easy_remix else positive.strip()
-        neg_text = _clean_prompt(negative, extractor).strip() if easy_remix else negative.strip()
+        pos_text = _clean_prompt(
+            positive,
+            extractor
+        ).strip() if easy_remix else positive.strip()
 
-        # --- Build A1111-style parameters string ---
-        model_hash_str = f", Model hash: {add_model_hash}" if add_model_hash else ""
-        hashes_str = f', Hashes: {json.dumps(hashes, separators=(",",":"))}' if hashes else ""
+        neg_text = _clean_prompt(
+            negative,
+            extractor
+        ).strip() if easy_remix else negative.strip()
 
-        a111_params = (
-            f"{pos_text}\n"
-            f"Negative prompt: {neg_text}\n"
-            f"Steps: {steps}, Sampler: {display_sampler}, CFG scale: {cfg}, "
-            f"Seed: {seed}, Size: {width}x{height}"
-            f"{model_hash_str}, Model: {basemodelname}{hashes_str}, Version: ComfyUI"
-        )
+        extra_metadata = {
+            "prompt": pos_text,
+            "negativePrompt": neg_text,
 
-        if download_civitai_data and civitai_resources:
-            a111_params += f', Civitai resources: {json.dumps(civitai_resources, separators=(",",":"))}' 
+            "cfgScale": cfg,
+            "steps": steps,
+            "seed": seed,
+
+            "sampler": display_sampler,
+            "scheduler": scheduler_name,
+            "denoise": denoise,
+
+            "width": width,
+            "height": height,
+
+            "resources": exif_resources
+        }
 
         # Log what was detected
         print(f"\n{'='*60}")
-        print(f"  CHRONO SAVE FOR CIVITAI — Auto-detected metadata:")
+        print(f"  COMFYUI CHRONO SAVER FOR CIVITAI — Auto-detected metadata:")
         print(f"  Model:     {basemodelname}")
         print(f"  Sampler:   {display_sampler}")
         print(f"  Steps:     {steps}  |  CFG: {cfg}  |  Seed: {seed}")
         print(f"  Size:      {width}x{height}")
         print(f"  Prompt:    {pos_text[:80]}{'...' if len(pos_text) > 80 else ''}")
         print(f"  Hash:      {modelhash}")
-        print(f"  Hashes:    {hashes}")
+
+        if airs:
+            print(f"  AIRs:      {', '.join(airs)}")
         if loras:
             print(f"  LoRAs:     {len(loras)} detected: {', '.join(loras.keys())}")
         if civitai_resources:
@@ -508,13 +994,55 @@ class ChronoSaveForCivit:
             final_filename = f"{unique_name}.{ext}"
             filepath = os.path.join(full_output_path, final_filename)
 
+            import copy
+
+            # ------------------------------------------------------------
+            # 1. Build synthetic Civitai prompt
+            # ------------------------------------------------------------
+
+            civitai_prompt = build_civitai_prompt(
+                positive=pos_text,
+                negative=neg_text,
+                modelname=modelname,
+                checkpoint_air=checkpoint_air,
+                checkpoint_airs=checkpoint_airs_for_prompt,
+                lora_entries=lora_entries,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler_name=scheduler_name,
+                denoise=denoise,
+                width=width,
+                height=height,
+            )
+
+            # ------------------------------------------------------------
+            # 2. Keep original ComfyUI workflow untouched
+            # ------------------------------------------------------------
+
+            workflow_pnginfo = {}
+
+            if extra_pnginfo and isinstance(extra_pnginfo, dict):
+                workflow_original = extra_pnginfo.get("workflow")
+
+                if workflow_original is not None:
+                    workflow_pnginfo["workflow"] = copy.deepcopy(workflow_original)
+
             save_image(
-                img, filepath, ext,
-                quality, True, False,
-                a111_params,
-                prompt if embed_workflow else None,
-                extra_pnginfo if embed_workflow else None,
+                img,
+                filepath,
+                ext,
+                quality,
+                True,
+                False,
+
+                civitai_prompt,       # PNG chunk: prompt
+                workflow_pnginfo,     # PNG chunk: workflow, ORIGINAL
+
                 embed_workflow,
+                metadata_resources,
+                extra_metadata,
             )
 
             subfolder = os.path.normpath(resolved_folder) if resolved_folder else ""
@@ -524,4 +1052,4 @@ class ChronoSaveForCivit:
                 "type": "output",
             })
 
-        return {"ui": {"images": results}}
+        return {"ui": {"images": results}}            

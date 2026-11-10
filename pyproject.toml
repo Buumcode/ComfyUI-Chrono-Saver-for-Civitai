@@ -1,6 +1,14 @@
 [project]
-name = "comfyui-chrono-save-for-civit"
-description = "Save images with Civitai-compatible metadata using Chrono's strftime folder format"
+name = "chrono-saver-for-civitai"
+description = "Save images with Civitai-compatible metadata"
 version = "1.0.0"
 license = { text = "MIT" }
+requires-python = ">=3.10"
 dependencies = ["piexif"]
+
+[project.urls]
+Repository = "https://github.com/Buumcode/ComfyUI-Chrono-Saver-for-Civitai"
+
+[tool.comfy]
+PublisherId = "buumcode"
+DisplayName = "Chrono Saver for Civitai"

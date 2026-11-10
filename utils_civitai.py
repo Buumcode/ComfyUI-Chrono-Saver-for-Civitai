@@ -6,6 +6,7 @@ import folder_paths
 
 from .utils import http_get_json
 
+
 MAX_HASH_LENGTH = 16 # skip larger unshortened hashes, such as full sha256 or blake3
 
 """
@@ -60,27 +61,31 @@ def get_civitai_sampler_name(sampler_name: str, scheduler: str) -> str:
             return sampler_name
 
 def get_civitai_metadata(
-        modelname: str,
-        ckpt_path: str,
-        modelhash: str,
-        loras: Dict[str, Tuple[str, float, str]],
-        embeddings: Dict[str, Tuple[str, float, str]],
-        manual_entries: Dict[str, tuple[str | None, float | None, str]],
-        download_civitai_data: bool) -> Tuple[List[Dict[str, str | float]], Dict[str, str], str | None]:
+    modelname: str,
+    ckpt_path: str,
+    modelhash: str,
+    loras: Dict[str, Tuple[str, float, str]],
+    embeddings: Dict[str, Tuple[str, float, str]],
+    manual_entries: Dict[str, tuple[str | None, float | None, str]],
+    download_civitai_data: bool,
+) -> List[Dict[str, str | float]]:
     """Download or load cache of Civitai data, save specially-formatted data to metadata"""
     civitai_resources: List[Dict[str, str | float]] = []
-    hashes = {}
-    add_model_hash = None
 
     if download_civitai_data:
         for name, (filepath, weight, hash) in ({ modelname: ( ckpt_path, None, modelhash ) } | loras | embeddings | manual_entries).items():
-            civitai_info = get_civitai_info(filepath, hash)
+            civitai_info = get_civitai_info(filepath, hash)            
+                       
             if civitai_info is not None:
                 resource_data: Dict[str, str | float] = {}
 
                 # Optional data - modelName, versionName
                 resource_data["modelName"] = civitai_info["model"]["name"]
                 resource_data["versionName"] = civitai_info["name"]
+
+                # Internal mapping back to the local resource.
+                resource_data["_local_name"] = name
+                resource_data["_local_hash"] = hash.lower() if hash else ""
 
                 # Weight/strength (for LoRA or embedding)
                 if weight is not None:
@@ -91,21 +96,10 @@ def get_civitai_metadata(
                 if "air" in civitai_info:
                     resource_data["air"] = civitai_info["air"]
                 else:
-                    # Fallback if AIR is not found
                     resource_data["modelVersionId"] = civitai_info["id"]
                 civitai_resources.append(resource_data)
-            else:
-                # Fallback in case the data wasn't loaded to add to the "Hashes" section
-                if name == modelname:
-                    add_model_hash = hash.upper()
-                else:
-                    hashes[name] = hash.upper()
-    else:
-        # Convert all hashes to JSON format
-        hashes = {key: value[2] for key, value in embeddings.items()} | {key: value[2] for key, value in loras.items()} | {key: value[2] for key, value in manual_entries.items()} | {"model": modelhash}
-        add_model_hash = modelhash
 
-    return civitai_resources, hashes, add_model_hash
+    return civitai_resources
 
 def get_civitai_info(path: Path | str | None, model_hash: str) -> dict[str, Any] | None:
     try:
@@ -153,6 +147,7 @@ def download_model_info(path: Path | str | None, model_hash: str) -> dict[str, o
     print(f"ComfyUI-Image-Saver: Downloading model info for '{model_label}'.")
 
     content = http_get_json(f'https://civitai.com/api/v1/model-versions/by-hash/{model_hash.upper()}')
+
     if content is None:
         return None
     model_id = content["modelId"]

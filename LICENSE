@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2025 KChronoKnight
+Copyright (c) 2026 Buumcode
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,6 +19,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Portions of this node include ChronoCore
+Copyright (c) 2026 Buumcode (MIT License)
+
+Portions of this node are based on Chrono-Save-for-Civitai
+Copyright (c) 2025 KChronoKnight (MIT License)
 
 Portions of this node are based on ComfyUI-Image-Saver
 Copyright (c) 2023 Girish Gopaul (MIT License)

@@ -58,7 +58,7 @@ def full_embedding_path_for(embedding: str) -> Optional[str]:
     """
     matching_embedding = get_file_path_match("embeddings", embedding)
     if matching_embedding is None:
-        print(f'ComfyUI-Image-Saver: could not find full path to embedding "{embedding}"')
+        print(f'ComfyUI-Image-Saver: Could not find full path to embedding "{embedding}"')
         return None
     return folder_paths.get_full_path("embeddings", matching_embedding)
 
@@ -69,7 +69,7 @@ def full_lora_path_for(lora: str) -> Optional[str]:
     # Find the matching lora path
     matching_lora = get_file_path_match("loras", lora)
     if matching_lora is None:
-        print(f'ComfyUI-Image-Saver: could not find full path to lora "{lora}"')
+        print(f'ComfyUI-Image-Saver: Could not find full path to lora "{lora}"')
         return None
     return folder_paths.get_full_path("loras", matching_lora)
 
@@ -87,7 +87,7 @@ def full_checkpoint_path_for(model_name: str) -> str:
     if matching_model:
         return folder_paths.get_full_path("diffusion_models", matching_model)
 
-    print(f'Could not find full path to checkpoint "{model_name}"')
+    print(f'ComfyUI-Image-Saver: Could not find full path to checkpoint "{model_name}"')
     return ''
 
 def get_file_path_iterator(folder_name: str, supported_extensions: Optional[Collection[str]] = None) -> Iterator[Path]:

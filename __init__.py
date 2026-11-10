@@ -1,11 +1,11 @@
-from .chrono_node import ChronoSaveForCivit
+from .chrono_node import ChronoSaverForCivitai
 
 NODE_CLASS_MAPPINGS = {
-    "ChronoSaveForCivit": ChronoSaveForCivit,
+    "ChronoSaverForCivitai": ChronoSaverForCivitai,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ChronoSaveForCivit": "💾 Chrono Save for Civitai",
+    "ChronoSaverForCivitai": "Chrono Saver for Civitai",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
